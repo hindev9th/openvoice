@@ -1,8 +1,8 @@
 # This repo adds ONNX export and inference function 
 ## How to use it?
-- For export: `python3 export_onnx.py --model_path checkpoint.pth --config_path config.json --output_path tone_converter.onnx
+- For export: `python3 export_onnx.py --model_path checkpoint.pth --config_path config.json --output_path tone_converter.onnx`
 
-- For inference: `python3 inference.py --config_path config.json --input_audio trump.wav --reference_audio biden.wav --output_dir outputs --device cpu
+- For inference: `python3 inference.py --config_path config.json --input_audio trump.wav --reference_audio biden.wav --output_dir outputs --device cpu `
 
 <div align="center">
   <div>&nbsp;</div>
