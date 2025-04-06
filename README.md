@@ -1,4 +1,4 @@
-**This repo adds ONNX export and inference function
+**This repo adds ONNX export and inference function **
 ** How to use it?
 - For export: python3 export_onnx.py --model_path checkpoint.pth --config_path config.json --output_path tone_converter.onnx
 
