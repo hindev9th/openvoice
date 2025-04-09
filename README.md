@@ -1,5 +1,29 @@
-# This repo adds ONNX export and inference function 
-## How to use it?
+# This repo makes some changes:
+## Add script for finetune: 
+### To finetune:
+- Add directories: `mkdir training_data reference_voices finetuned_model`
+- Please please audio files for training in the training_data folder and reference_voices folder, files can be .wav for high quality
+- File .wav must be 2-20s long, no noise, clear, high quality, single speaker
+- The finetune script will use the base checkpoint.pt model to generate the output then compare this output with the referencing voice.
+- The idea is that if we can provide more diverse voices, the model will learn better
+- Finetune script:
+  `
+  python3 finetune_tone_converter.py \
+    --config_path config.json \
+    --model_path checkpoint.pth \
+    --data_dir training_data \
+    --reference_audio reference_voices \
+    --output_dir finetuned_model \
+    --epochs 100 \
+    --batch_size 4 \
+    --learning_rate 1e-4 \
+    --device cuda
+  `
+### To test the finetuned model:
+- Run the script: `python3 inference_pt.py --config_path config.json --model_path finetuned_model/final_model.pth --input_audio biden.wav --reference_audio trump.wav --output_dir outputs --debug`
+  
+## ONNX export and inference: 
+### How to use it?
 - For export: `python3 export_onnx.py --model_path checkpoint.pth --config_path config.json --output_path tone_converter.onnx`
 
 - For inference: `python3 inference.py --config_path config.json --input_audio trump.wav --reference_audio biden.wav --output_dir outputs --device cpu `
