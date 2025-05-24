@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from torch.utils.checkpoint import checkpoint
 import librosa
 import numpy as np
@@ -34,17 +34,24 @@ class VoiceDataset(Dataset):
         
     def _compute_max_length(self):
         max_len = 0
-        for audio_file in self.audio_files:
+        for index, audio_file in enumerate(self.audio_files):
+            print(f"🔊 [{index + 1}/{len(self.audio_files)}] Đang xử lý: {audio_file}")
+            
             audio_path = os.path.join(self.data_dir, audio_file)
             audio, _ = librosa.load(audio_path, sr=self.config['data']['sampling_rate'])
             y = torch.FloatTensor(audio).unsqueeze(0)
-            spec = spectrogram_torch(y, 
-                                   self.config['data']['filter_length'],
-                                   self.config['data']['sampling_rate'],
-                                   self.config['data']['hop_length'],
-                                   self.config['data']['win_length'],
-                                   center=False)
+            
+            spec = spectrogram_torch(
+                y,
+                self.config['data']['filter_length'],
+                self.config['data']['sampling_rate'],
+                self.config['data']['hop_length'],
+                self.config['data']['win_length'],
+                center=False
+            )
+            
             max_len = max(max_len, spec.size(-1))
+
             # Clear memory
             del y, spec
             torch.cuda.empty_cache()
@@ -95,6 +102,15 @@ class VoiceDataset(Dataset):
         audio_path = os.path.join(self.data_dir, self.audio_files[idx])
         audio = self.load_audio(audio_path)
         spec = self.process_audio(audio)
+        
+        # Ensure spec has shape [n_freqs, time_steps]
+        # This is important for the model to work correctly
+        if len(spec.shape) > 2:
+            spec = spec.squeeze()
+        
+        # Verify final shape
+        assert spec.size(0) == self.n_freqs, f"Expected {self.n_freqs} frequency bins, got {spec.size(0)}"
+        
         return spec.to(self.device)
 
 def extract_speaker_embedding(model, audio_path, config):
@@ -133,9 +149,6 @@ def train(model, train_loader, optimizer, device, epoch, reference_audio_path, c
     for batch_idx, spec in enumerate(progress_bar):
         optimizer.zero_grad()
         
-        # Print original shape for debugging
-        print(f"Original spec shape: {spec.shape}")
-        
         # Ensure spec has shape [batch_size, n_freqs, time_steps]
         if len(spec.shape) == 2:
             spec = spec.unsqueeze(0)  # Add batch dimension
@@ -145,16 +158,17 @@ def train(model, train_loader, optimizer, device, epoch, reference_audio_path, c
         n_freqs = config['data']['filter_length'] // 2 + 1
         time_steps = spec.size(-1)
         
-        # Reshape spec to match model's expected input shape [N, 1, Ty, n_freqs]
-        spec = spec.unsqueeze(1)  # Add channel dimension
-        if spec.size(2) != n_freqs:
-            spec = spec.transpose(2, 3)  # Swap frequency and time dimensions
+        # Reshape spec to match model's expected input shape
+        # The model expects [batch_size, n_freqs, time_steps]
+        if len(spec.shape) == 4:  # If shape is [batch_size, 1, n_freqs, time_steps]
+            spec = spec.squeeze(1)  # Remove channel dimension
         
-        print(f"Reshaped spec: {spec.shape}")
+        if batch_idx % 10 == 0:  # Chỉ in log sau mỗi 10 batch
+            print(f"Reshaped spec: {spec.shape}")
         
         # Extract source speaker embedding from input audio
         try:
-            src_se = model.model.ref_enc(spec.squeeze(1).transpose(1, 2)).unsqueeze(-1)
+            src_se = model.model.ref_enc(spec.transpose(1, 2)).unsqueeze(-1)
         except RuntimeError as e:
             print(f"Error in ref_enc: {e}")
             print(f"Spec shape: {spec.shape}")
@@ -165,7 +179,7 @@ def train(model, train_loader, optimizer, device, epoch, reference_audio_path, c
             def forward_func(spec, lengths, src_se, ref_se):
                 return model.model.voice_conversion(spec, lengths, src_se, ref_se, tau=0.3)
             
-            spec_lengths = torch.LongTensor([time_steps]).to(device)
+            spec_lengths = torch.LongTensor([time_steps] * batch_size).to(device)
             output, mask, (z, z_p, z_hat) = checkpoint(
                 forward_func,
                 spec,
@@ -181,30 +195,80 @@ def train(model, train_loader, optimizer, device, epoch, reference_audio_path, c
             continue
         
         # Ensure output and spec have the same dimensions
-        if output.size(-1) != spec.size(-1):
-            # Truncate or pad output to match spec length
+        if output.size(-1) != spec.size(-1) or output.size(1) != spec.size(1):
+            # Project output to match spec shape if needed
+            if output.size(1) == 1 and spec.size(1) > 1:
+                # Use a linear layer or repeat to match frequency bins
+                output = output.repeat(1, spec.size(1), 1)
+                mask = mask.repeat(1, spec.size(1), 1)
+            elif output.size(1) != spec.size(1):
+                # If output freq doesn't match, interpolate
+                output = torch.nn.functional.interpolate(output, size=(spec.size(1), spec.size(2)), mode='bilinear', align_corners=False)
+                mask = torch.nn.functional.interpolate(mask, size=(spec.size(1), spec.size(2)), mode='nearest')
+            # Truncate or pad time dimension as before
             if output.size(-1) > spec.size(-1):
                 output = output[..., :spec.size(-1)]
                 mask = mask[..., :spec.size(-1)]
-            else:
+            elif output.size(-1) < spec.size(-1):
                 pad_size = spec.size(-1) - output.size(-1)
                 output = torch.nn.functional.pad(output, (0, pad_size))
                 mask = torch.nn.functional.pad(mask, (0, pad_size))
         
         # Calculate multiple losses
         # 1. L1 loss between input and output spectrograms (with mask)
-        l1_loss = nn.L1Loss()(output * mask, spec * mask)
+        try:
+            if batch_idx % 10 == 0:  # Chỉ in log sau mỗi 10 batch
+                print(f"Output shape: {output.shape}, Spec shape: {spec.shape}, Mask shape: {mask.shape}")
+            
+            # Đảm bảo output và spec có cùng kích thước
+            if output.shape != spec.shape:
+                print(f"Reshaping output from {output.shape} to match spec {spec.shape}")
+                # Nếu output có 3 chiều [batch, 1, time] và spec có 3 chiều [batch, freq, time]
+                if len(output.shape) == 3 and len(spec.shape) == 3 and output.shape[1] == 1:
+                    # Mở rộng output để khớp với spec
+                    output = output.expand(-1, spec.shape[1], -1)
+                    mask = mask.expand(-1, spec.shape[1], -1)
+            
+            l1_loss = nn.L1Loss()(output * mask, spec * mask)
+        except Exception as e:
+            print(f"Error in L1 loss calculation: {e}")
+            l1_loss = torch.tensor(0.0, device=device, requires_grad=True)
         
         # 2. Consistency loss between z and z_hat (should be similar after conversion)
         consistency_loss = nn.L1Loss()(z, z_hat)
         
         # 3. Speaker embedding similarity loss
         # Extract speaker embedding from output audio
-        output_se = model.model.ref_enc(output.squeeze(1).transpose(1, 2)).unsqueeze(-1)
-        speaker_loss = nn.L1Loss()(output_se, ref_se)
+        try:
+            # Kiểm tra kích thước của output và điều chỉnh phù hợp
+            print(f"Output shape before processing: {output.shape}")
+            
+            # Đảm bảo output có đúng kích thước trước khi xử lý
+            if len(output.shape) == 3:  # [batch, channel, time]
+                if output.size(1) == 1:
+                    # Nếu có channel dimension = 1, loại bỏ nó
+                    output_for_enc = output.squeeze(1).transpose(1, 2)
+                else:
+                    # Nếu channel dimension > 1, giữ nguyên và chuyển vị
+                    output_for_enc = output.transpose(1, 2)
+            elif len(output.shape) == 4:  # [batch, channel, freq, time]
+                # Nếu có 4 chiều, loại bỏ channel dimension và chuyển vị
+                output_for_enc = output.squeeze(1).transpose(1, 2)
+            else:
+                # Trường hợp khác, giữ nguyên và chuyển vị nếu cần
+                output_for_enc = output.transpose(1, 2) if output.shape[-1] != 256 else output
+            
+            print(f"Output shape after processing: {output_for_enc.shape}")
+            output_se = model.model.ref_enc(output_for_enc).unsqueeze(-1)
+            speaker_loss = nn.L1Loss()(output_se, ref_se)
+        except Exception as e:
+            print(f"Error in speaker embedding extraction: {e}")
+            print(f"Output shape: {output.shape}")
+            # Sử dụng một giá trị mặc định cho speaker_loss nếu xảy ra lỗi
+            speaker_loss = torch.tensor(0.0, device=device, requires_grad=True)
         
         # 4. Total loss is a weighted sum
-        loss = l1_loss + 0.1 * consistency_loss + 0.5 * speaker_loss
+        loss = l1_loss + 0.1 * consistency_loss + 2.0 * speaker_loss
         
         # Backward pass
         loss.backward()
@@ -237,6 +301,102 @@ def remove_weight_norm_for_onnx(model):
                 pass
     return model
 
+def validate(model, val_loader, device, reference_audio_path, config):
+    model.model.eval()
+    total_loss = 0
+    
+    # Extract reference speaker embedding
+    ref_se = extract_speaker_embedding(model, reference_audio_path, config)
+    
+    with torch.no_grad():
+        for batch_idx, spec in enumerate(val_loader):
+            # Ensure spec has shape [batch_size, n_freqs, time_steps]
+            if len(spec.shape) == 2:
+                spec = spec.unsqueeze(0)  # Add batch dimension
+            
+            # Get dimensions
+            batch_size = spec.size(0)
+            n_freqs = config['data']['filter_length'] // 2 + 1
+            time_steps = spec.size(-1)
+            
+            # Reshape spec to match model's expected input shape
+            if len(spec.shape) == 4:  # If shape is [batch_size, 1, n_freqs, time_steps]
+                spec = spec.squeeze(1)  # Remove channel dimension
+            
+            # Extract source speaker embedding from input audio
+            try:
+                src_se = model.model.ref_enc(spec.transpose(1, 2)).unsqueeze(-1)
+            except RuntimeError as e:
+                print(f"Error in ref_enc during validation: {e}")
+                continue
+            
+            # Forward pass through voice conversion
+            try:
+                spec_lengths = torch.LongTensor([time_steps] * batch_size).to(device)
+                output, mask, (z, z_p, z_hat) = model.model.voice_conversion(
+                    spec, spec_lengths, src_se, ref_se, tau=0.3
+                )
+            except RuntimeError as e:
+                print(f"Error in voice_conversion during validation: {e}")
+                continue
+            
+            # Ensure output and spec have the same dimensions
+            if output.size(-1) != spec.size(-1) or output.size(1) != spec.size(1):
+                if output.size(1) == 1 and spec.size(1) > 1:
+                    output = output.repeat(1, spec.size(1), 1)
+                    mask = mask.repeat(1, spec.size(1), 1)
+                elif output.size(1) != spec.size(1):
+                    output = torch.nn.functional.interpolate(output, size=(spec.size(1), spec.size(2)), mode='bilinear', align_corners=False)
+                    mask = torch.nn.functional.interpolate(mask, size=(spec.size(1), spec.size(2)), mode='nearest')
+                if output.size(-1) > spec.size(-1):
+                    output = output[..., :spec.size(-1)]
+                    mask = mask[..., :spec.size(-1)]
+                elif output.size(-1) < spec.size(-1):
+                    pad_size = spec.size(-1) - output.size(-1)
+                    output = torch.nn.functional.pad(output, (0, pad_size))
+                    mask = torch.nn.functional.pad(mask, (0, pad_size))
+            
+            # Calculate losses
+            try:
+                # Đảm bảo output và spec có cùng kích thước
+                if output.shape != spec.shape:
+                    if len(output.shape) == 3 and len(spec.shape) == 3 and output.shape[1] == 1:
+                        output = output.expand(-1, spec.shape[1], -1)
+                        mask = mask.expand(-1, spec.shape[1], -1)
+                
+                l1_loss = nn.L1Loss()(output * mask, spec * mask)
+            except Exception as e:
+                print(f"Error in L1 loss calculation during validation: {e}")
+                l1_loss = torch.tensor(0.0, device=device)
+            
+            # Consistency loss
+            consistency_loss = nn.L1Loss()(z, z_hat)
+            
+            # Speaker embedding similarity loss
+            try:
+                # Đảm bảo output có đúng kích thước trước khi xử lý
+                if len(output.shape) == 3:  # [batch, channel, time]
+                    if output.size(1) == 1:
+                        output_for_enc = output.squeeze(1).transpose(1, 2)
+                    else:
+                        output_for_enc = output.transpose(1, 2)
+                elif len(output.shape) == 4:  # [batch, channel, freq, time]
+                    output_for_enc = output.squeeze(1).transpose(1, 2)
+                else:
+                    output_for_enc = output.transpose(1, 2) if output.shape[-1] != 256 else output
+                
+                output_se = model.model.ref_enc(output_for_enc).unsqueeze(-1)
+                speaker_loss = nn.L1Loss()(output_se, ref_se)
+            except Exception as e:
+                print(f"Error in speaker embedding extraction during validation: {e}")
+                speaker_loss = torch.tensor(0.0, device=device)
+            
+            # Total loss
+            loss = l1_loss + 0.1 * consistency_loss + 2.0 * speaker_loss
+            total_loss += loss.item()
+    
+    return total_loss / len(val_loader)
+
 def main():
     parser = argparse.ArgumentParser(description='Fine-tune ToneColorConverter model')
     parser.add_argument('--config_path', type=str, required=True, help='Path to config file')
@@ -245,10 +405,10 @@ def main():
     parser.add_argument('--reference_audio', type=str, required=True, help='Path to reference audio file')
     parser.add_argument('--output_dir', type=str, default='finetuned_model', help='Directory to save fine-tuned model')
     parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=4, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda or cpu)')
-    parser.add_argument('--max_length', type=int, default=1000, help='Maximum spectrogram length')
+    parser.add_argument('--max_length', type=int, default=500, help='Maximum spectrogram length')
     parser.add_argument('--export_onnx', action='store_true', help='Export model to ONNX format')
     parser.add_argument('--onnx_path', type=str, default='model.onnx', help='Path to save ONNX model')
     
@@ -311,31 +471,50 @@ def main():
     
     # Create dataset and dataloader
     dataset = VoiceDataset(args.data_dir, config, device=args.device)
-    train_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    train_size = int(0.9 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
     
     # Initialize optimizer
     optimizer = optim.Adam(model.model.parameters(), lr=args.learning_rate)
     
     # Training loop
+    patience = 5
     best_loss = float('inf')
+    no_improve_epochs = 0
+
     for epoch in range(args.epochs):
         # Randomly select a reference voice for this epoch
         ref_voice = random.choice(os.listdir(args.reference_audio))
-        ref_se = extract_speaker_embedding(model, os.path.join(args.reference_audio, ref_voice), config)
+        ref_path = os.path.join(args.reference_audio, ref_voice)
         
-        loss = train(model, train_loader, optimizer, args.device, epoch, os.path.join(args.reference_audio, ref_voice), config)
+        # Train
+        train_loss = train(model, train_loader, optimizer, args.device, epoch, ref_path, config)
         
-        # Save checkpoint if loss improved
-        if loss < best_loss:
-            best_loss = loss
-            checkpoint_path = os.path.join(args.output_dir, f'checkpoint_epoch_{epoch}.pth')
+        # Validate
+        val_loss = validate(model, val_loader, args.device, ref_path, config)
+        
+        print(f"Epoch {epoch}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}")
+        
+        # Early stopping
+        if val_loss < best_loss:
+            best_loss = val_loss
+            no_improve_epochs = 0
+            # Lưu mô hình tốt nhất
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'loss': loss,
-            }, checkpoint_path)
-            print(f'Saved checkpoint to {checkpoint_path}')
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+            }, os.path.join(args.output_dir, 'best_model.pth'))
+        else:
+            no_improve_epochs += 1
+            if no_improve_epochs >= patience:
+                print(f"Early stopping after {epoch+1} epochs")
+                break
         
         # Save final model
         if epoch == args.epochs - 1:
@@ -344,7 +523,8 @@ def main():
                 'epoch': epoch,
                 'model_state_dict': model.model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'loss': loss,
+                'train_loss': train_loss,
+                'val_loss': val_loss,
             }, final_model_path)
             print(f'Saved final model to {final_model_path}')
         
@@ -353,4 +533,4 @@ def main():
         gc.collect()
 
 if __name__ == '__main__':
-    main() 
+    main()

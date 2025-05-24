@@ -109,7 +109,13 @@ class ToneColorConverter(OpenVoiceBaseClass):
             self.watermark_model = None
         self.version = getattr(self.hps, '_version_', "v1")
 
-
+    def load_source_se(self, speaker_key):
+        source_se_path = f'base_speakers/ses/{speaker_key}.pth'
+        # Load source speaker embedding
+        if not os.path.exists(source_se_path):
+            raise Exception(f"Source speaker embedding not found: {source_se_path}")
+        
+        return torch.load(source_se_path, map_location=self.device)
 
     def extract_se(self, ref_wav_list, se_save_path=None):
         if isinstance(ref_wav_list, str):

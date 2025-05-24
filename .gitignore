@@ -5,9 +5,14 @@ outputs
 outputs_v2
 checkpoints
 checkpoints_v2
+test
+training_data
+resources
+reference_voices
 trash
 examples*
 .env
+.vscode
 build
 *.egg-info/
 *.zip
