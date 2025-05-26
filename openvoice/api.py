@@ -9,6 +9,7 @@ import librosa
 from openvoice.text import text_to_sequence
 from openvoice.mel_processing import spectrogram_torch
 from openvoice.models import SynthesizerTrn
+from openvoice.download_utils import load_or_download_speaker
 
 
 class OpenVoiceBaseClass(object):
@@ -110,7 +111,7 @@ class ToneColorConverter(OpenVoiceBaseClass):
         self.version = getattr(self.hps, '_version_', "v1")
 
     def load_source_se(self, speaker_key):
-        source_se_path = f'base_speakers/ses/{speaker_key}.pth'
+        source_se_path = load_or_download_speaker(speaker_id=speaker_key)
         # Load source speaker embedding
         if not os.path.exists(source_se_path):
             raise Exception(f"Source speaker embedding not found: {source_se_path}")

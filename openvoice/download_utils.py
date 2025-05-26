@@ -22,3 +22,8 @@ def load_or_download_model( use_hf=True, ckpt_path=None):
         else:
             ckpt_path = cached_path(DOWNLOAD_CKPT_URL)
     return ckpt_path
+
+def load_or_download_speaker(use_hf=True, speaker_id=None):
+    if config_path is None:
+        config_path = hf_hub_download(repo_id=CONVERT_TO_HF_REPO_ID, filename=f"base_speakers/ses/{speaker_id}.pth")
+    return config_path
