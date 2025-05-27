@@ -38,7 +38,7 @@ setup(name='MyShell-OpenVoice',
             'pypinyin==0.50.0',
             'cn2an==0.5.22',
             'jieba==0.42.1',
-            'gradio==3.48.0',
+            'gradio==3.50.2',
             'langid==1.1.6'
       ],
       zip_safe=False
