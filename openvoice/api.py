@@ -160,7 +160,7 @@ class ToneColorConverter(OpenVoiceBaseClass):
             spec_lengths = torch.LongTensor([spec.size(-1)]).to(self.device)
             audio = self.model.voice_conversion(spec, spec_lengths, sid_src=src_se, sid_tgt=tgt_se, tau=tau)[0][
                         0, 0].data.cpu().float().numpy()
-            audio = self.add_watermark(audio, message)
+            # audio = self.add_watermark(audio, message)
             if output_path is None:
                 return audio
             else:
